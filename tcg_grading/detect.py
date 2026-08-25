@@ -437,10 +437,9 @@ def detect_card(card_image: CardImage, pixels_per_mm: Optional[float] = None) ->
     log.info(f"Quad after ordering: {ordered.tolist()}")
 
     # Black background detection finds the card+border boundary.
-    # For corner grading: we extract from original image at quad vertices (perfect).
-    # For edge/surface grading: rectified image should contain ONLY card, no black background.
-    # Apply NEGATIVE expansion (shrink inward) to exclude black frame entirely.
-    EXPANSION_PX = -10  # Shrink 10px inward to fully exclude black frame
+    # For corner grading: we need the full card corners with some black background in rectified image.
+    # Use moderate positive expansion to extend beyond detected boundary.
+    EXPANSION_PX = 15  # Extend 15px outward to capture all corners
 
     # Calculate the center and expand each corner away from it
     center = ordered.mean(axis=0)
@@ -457,15 +456,18 @@ def detect_card(card_image: CardImage, pixels_per_mm: Optional[float] = None) ->
     log.info(f"Quad after {EXPANSION_PX}px outward expansion: {expanded.tolist()}")
 
     # Destination corners for rectified output
+    # Add margin around card to preserve corner boundaries with black background
+    # Margin needs to be large enough to capture black background around all corners
+    MARGIN = 50  # 50px margin for reliable corner detection
     dst = np.array([
-        [0, 0],
-        [CANONICAL_WIDTH - 1, 0],
-        [CANONICAL_WIDTH - 1, CANONICAL_HEIGHT - 1],
-        [0, CANONICAL_HEIGHT - 1],
+        [MARGIN, MARGIN],
+        [CANONICAL_WIDTH - 1 + MARGIN, MARGIN],
+        [CANONICAL_WIDTH - 1 + MARGIN, CANONICAL_HEIGHT - 1 + MARGIN],
+        [MARGIN, CANONICAL_HEIGHT - 1 + MARGIN],
     ], dtype=np.float32)
 
     M = cv2.getPerspectiveTransform(expanded, dst)
-    rectified = cv2.warpPerspective(rgb, M, (CANONICAL_WIDTH, CANONICAL_HEIGHT))
+    rectified = cv2.warpPerspective(rgb, M, (CANONICAL_WIDTH + 2*MARGIN, CANONICAL_HEIGHT + 2*MARGIN))
 
     # Verify that the detected region actually contains a card
     quad_area = cv2.contourArea(quad)
