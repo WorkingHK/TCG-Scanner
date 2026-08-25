@@ -19,8 +19,79 @@ logger = logging.getLogger(__name__)
 # Edge strip height in pixels (from the rectified card image)
 # Captures the actual card edge including the side touching the frame
 EDGE_STRIP_HEIGHT = 70
-# NO inset - capture from absolute edge to get the real border
-EDGE_INSET_PX = 0
+# Inset from absolute edge to avoid black background artifacts in rectified image
+EDGE_INSET_PX = 15  # Start 15px inward from edge to avoid black frame artifacts
+
+
+def _crop_edge_strips_from_original(
+    original_rgb: np.ndarray,
+    quad_corners: np.ndarray,
+    strip_width: int = 100
+) -> dict[str, np.ndarray]:
+    """
+    Extract edge strips directly from the ORIGINAL image along the detected quad edges.
+    This captures the true card edge without black background interference.
+
+    Args:
+        original_rgb: Original captured image (before rectification)
+        quad_corners: 4 corners of detected card quad in [tl, tr, br, bl] order
+        strip_width: Width of strip perpendicular to edge (pixels)
+
+    Returns:
+        Dict of edge strips {name: rgb_array}
+    """
+    strips = {}
+
+    # Define edges as pairs of corners
+    edges = {
+        "top": (quad_corners[0], quad_corners[1]),      # tl → tr
+        "right": (quad_corners[1], quad_corners[2]),    # tr → br
+        "bottom": (quad_corners[2], quad_corners[3]),   # br → bl
+        "left": (quad_corners[3], quad_corners[0]),     # bl → tl
+    }
+
+    h, w = original_rgb.shape[:2]
+
+    for edge_name, (p1, p2) in edges.items():
+        # Vector along the edge
+        edge_vec = p2 - p1
+        edge_len = np.linalg.norm(edge_vec)
+        edge_unit = edge_vec / (edge_len + 1e-6)
+
+        # Perpendicular vector pointing inward (toward card center)
+        perp_unit = np.array([-edge_unit[1], edge_unit[0]])
+
+        # Sample points along the edge
+        num_samples = int(edge_len)
+        sample_points = []
+
+        for i in range(num_samples):
+            t = i / max(1, num_samples - 1)
+            edge_point = p1 + t * edge_vec
+
+            # Extract strip_width pixels perpendicular to edge (going inward)
+            strip_pixels = []
+            for d in range(strip_width):
+                sample_pt = edge_point + perp_unit * d
+                x, y = int(sample_pt[0]), int(sample_pt[1])
+
+                if 0 <= x < w and 0 <= y < h:
+                    strip_pixels.append(original_rgb[y, x])
+                else:
+                    # Out of bounds - use black
+                    strip_pixels.append([0, 0, 0])
+
+            sample_points.append(strip_pixels)
+
+        # Convert to numpy array: [edge_length, strip_width, 3]
+        if sample_points:
+            strip_array = np.array(sample_points, dtype=np.uint8)
+            strips[edge_name] = strip_array
+        else:
+            # Fallback empty strip
+            strips[edge_name] = np.zeros((100, strip_width, 3), dtype=np.uint8)
+
+    return strips
 
 
 def _crop_edge_strips(rgb: np.ndarray) -> dict[str, np.ndarray]:
@@ -47,7 +118,13 @@ def _crop_edge_strips(rgb: np.ndarray) -> dict[str, np.ndarray]:
 
 def _measure_edge(strip: np.ndarray, orientation: str) -> dict:
     """
-    Measure edge quality metrics for one edge strip.
+    Measure edge quality by finding the card's outer border boundary.
+
+    Strategy:
+    - Find the transition from card border (light) to card interior/background
+    - Measure straightness of this boundary line
+    - Avoid using Canny which is too sensitive to holographic texture
+
     Returns: rms_deviation, chip_count, max_notch_depth
     orientation: 'horizontal' or 'vertical'
     """
@@ -55,44 +132,85 @@ def _measure_edge(strip: np.ndarray, orientation: str) -> dict:
         gray = cv2.cvtColor(strip, cv2.COLOR_RGB2GRAY)
         h, w = gray.shape
 
-        # Find the card border edge using Canny + contour
-        blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-        edges = cv2.Canny(blurred, 30, 100)
+        # Smooth to reduce holographic pattern noise
+        smoothed = cv2.GaussianBlur(gray, (9, 9), 3.0)
 
         if orientation == "horizontal":
-            # For top/bottom strips, find the horizontal edge
-            # Sum edge pixels column by column, find row of maximum response
-            edge_rows = []
-            for col in range(0, w, 5):
-                col_slice = edges[:, col]
-                if col_slice.max() > 0:
-                    edge_rows.append(np.argmax(col_slice))
-            if len(edge_rows) < 3:
+            # For top/bottom strips: find the edge row for each column
+            # The edge is where brightness drops significantly (border → interior)
+            edge_positions = []
+
+            for col in range(0, w, 5):  # Sample every 5 pixels
+                col_slice = smoothed[:, col]
+
+                # Find the gradient (rate of brightness change)
+                gradient = np.diff(col_slice.astype(float))
+
+                # Look for the largest negative gradient (bright → dark transition)
+                if len(gradient) > 0:
+                    max_drop_idx = np.argmin(gradient)
+
+                    # Only count if the drop is significant (>10 brightness units)
+                    if gradient[max_drop_idx] < -10:
+                        edge_positions.append(max_drop_idx)
+
+            if len(edge_positions) < 20:
                 return {"rms_deviation": None, "chip_count": None, "max_notch_depth": None,
                         "error": "insufficient edge points detected"}
-            edge_arr = np.array(edge_rows, dtype=float)
+
+            edge_arr = np.array(edge_positions, dtype=float)
+
         else:
-            # For left/right strips, find the vertical edge
-            edge_cols = []
-            for row in range(0, h, 5):
-                row_slice = edges[row, :]
-                if row_slice.max() > 0:
-                    edge_cols.append(np.argmax(row_slice))
-            if len(edge_cols) < 3:
+            # For left/right strips: find the edge column for each row
+            edge_positions = []
+
+            for row in range(0, h, 5):  # Sample every 5 pixels
+                row_slice = smoothed[row, :]
+
+                # Find the gradient
+                gradient = np.diff(row_slice.astype(float))
+
+                # Look for the largest negative gradient (bright → dark transition)
+                if len(gradient) > 0:
+                    max_drop_idx = np.argmin(gradient)
+
+                    # Only count if the drop is significant
+                    if gradient[max_drop_idx] < -10:
+                        edge_positions.append(max_drop_idx)
+
+            if len(edge_positions) < 20:
                 return {"rms_deviation": None, "chip_count": None, "max_notch_depth": None,
                         "error": "insufficient edge points detected"}
-            edge_arr = np.array(edge_cols, dtype=float)
+
+            edge_arr = np.array(edge_positions, dtype=float)
 
         # Fit line and compute RMS deviation
         ideal = np.linspace(edge_arr[0], edge_arr[-1], len(edge_arr))
         deviations = edge_arr - ideal
+
+        # Filter outliers using IQR method to avoid extreme false positives
+        q1 = np.percentile(np.abs(deviations), 25)
+        q3 = np.percentile(np.abs(deviations), 75)
+        iqr = q3 - q1
+        outlier_threshold = q3 + 1.5 * iqr
+
+        # Filter deviations to remove outliers for notch calculation
+        filtered_deviations = deviations[np.abs(deviations) <= outlier_threshold]
+
+        if len(filtered_deviations) < len(deviations) * 0.5:
+            # Too many outliers filtered - use original
+            filtered_deviations = deviations
+
         rms = float(np.sqrt(np.mean(deviations ** 2)))
 
-        # Count chips: deviations > 3px from median
-        median_pos = float(np.median(edge_arr))
-        chip_threshold = 3.0
-        chips = np.sum(np.abs(edge_arr - median_pos) > chip_threshold)
-        max_notch = float(np.max(np.abs(edge_arr - median_pos)))
+        # Count chips: significant deviations from the ideal line
+        # Use more lenient threshold for high-res images to avoid false positives
+        # For a ~630px wide card from 6000×8000px source, 15px tolerance is reasonable for near-mint
+        chip_threshold = 15.0  # Was 8.0 - still too strict for natural edge variation
+        chips = np.sum(np.abs(deviations) > chip_threshold)
+
+        # Max notch depth: maximum deviation from ideal line (after outlier filtering)
+        max_notch = float(np.max(np.abs(filtered_deviations)))
 
         return {
             "rms_deviation": round(rms, 2),
@@ -194,6 +312,7 @@ def grade_edges(card: DetectedCard, client, output_dir: Optional[Path] = None) -
     """
     Grade card edges using CV measurements only (VLM disabled for tuning).
     """
+    # Use rectified image, but filter out black background in measurements
     strips = _crop_edge_strips(card.rgb)
 
     orientations = {
@@ -215,24 +334,24 @@ def grade_edges(card: DetectedCard, client, output_dir: Optional[Path] = None) -
 
         if cv_base_score is not None:
             final_grade = cv_base_score
-            vlm_grade_1000 = cv_base_score
+            vlm_grade = cv_base_score
             adjustment = 0
         else:
             # Fallback: no CV metrics, use default
-            final_grade = 500.0
-            vlm_grade_1000 = 500.0
+            final_grade = 5.0
+            vlm_grade = 5.0
             adjustment = 0
 
-        # Grade is 0-1000 (TAG scale)
+        # Grade is 1-10 scale (PSA style)
         confidence = "medium"
 
         evidence = {
             "cv_metrics": metrics,
             "cv_available": cv_ok,
-            "cv_base_score_1000": cv_base_score,
-            "vlm_raw_grade_1000": vlm_grade_1000,
+            "cv_base_score": cv_base_score,
+            "vlm_raw_grade": vlm_grade,
             "vlm_adjustment": adjustment,
-            "final_grade_1000": round(final_grade, 0),
+            "final_grade": round(final_grade, 1),
             "vlm_disabled": True,
             "per_edge": {},
             "worst_edge": None,
@@ -264,7 +383,7 @@ def grade_edges(card: DetectedCard, client, output_dir: Optional[Path] = None) -
             cv2.imwrite(str(annotated_path), composite)
 
         return CriterionGrade(
-            grade=final_grade,  # 0-1000 scale
+            grade=final_grade,  # 1-10 scale
             confidence=confidence,
             evidence=evidence,
             annotated_crop_path=annotated_path,
@@ -273,7 +392,7 @@ def grade_edges(card: DetectedCard, client, output_dir: Optional[Path] = None) -
     except Exception as e:
         logger.error(f"Edge grading failed: {e}")
         return CriterionGrade(
-            grade=100.0,  # 0-1000 scale
+            grade=1.0,  # 1-10 scale
             confidence="low",
             evidence={"cv_metrics": metrics, "cv_available": cv_ok},
             annotated_crop_path=None,
@@ -284,7 +403,7 @@ def grade_edges(card: DetectedCard, client, output_dir: Optional[Path] = None) -
 def _compute_cv_base_score(metrics: dict[str, dict]) -> Optional[float]:
     """
     Compute base edge grade from CV measurements.
-    Maps rms_deviation, chip_count, and max_notch_depth to 0-1000 scale.
+    Maps rms_deviation, chip_count, and max_notch_depth to 1-10 scale.
     Returns the worst edge score (most conservative).
     Returns None if no valid measurements available.
     """
@@ -302,39 +421,54 @@ def _compute_cv_base_score(metrics: dict[str, dict]) -> Optional[float]:
         if rms is None or chips is None or notch is None:
             continue
 
-        # Score RMS deviation (straightness): 0-1px=1000, 1-2px=900, 2-3px=800, 3-5px=600, >5px=lower
-        if rms <= 1.0:
-            rms_score = 1000.0
-        elif rms <= 2.0:
-            rms_score = 900.0
-        elif rms <= 3.0:
-            rms_score = 800.0
-        elif rms <= 5.0:
-            rms_score = 600.0 + (5.0 - rms) / 2.0 * 200.0  # 600-800 linear
+        # Score RMS deviation (straightness): adjusted for high-res images
+        # For 630px card, allow larger absolute deviation
+        # 0-3px=10.0, 3-8px=9.0, 8-15px=8.0, 15-25px=7.0, 25-40px=5.0, >40px=lower
+        if rms <= 3.0:
+            rms_score = 10.0
+        elif rms <= 8.0:
+            rms_score = 9.0 + (8.0 - rms) / 5.0 * 1.0  # 9.0-10.0 linear
+        elif rms <= 15.0:
+            rms_score = 8.0 + (15.0 - rms) / 7.0 * 1.0  # 8.0-9.0 linear
+        elif rms <= 25.0:
+            rms_score = 7.0 + (25.0 - rms) / 10.0 * 1.0  # 7.0-8.0 linear
+        elif rms <= 40.0:
+            rms_score = 5.0 + (40.0 - rms) / 15.0 * 2.0  # 5.0-7.0 linear
         else:
-            rms_score = max(100.0, 600.0 - (rms - 5.0) * 50.0)
+            rms_score = max(1.0, 5.0 - (rms - 40.0) * 0.2)
 
-        # Score chip count: 0=1000, 1-2=850, 3-5=700, 6-10=500, >10=lower
+        # Score chip count: more lenient for near-mint cards with natural variation
+        # 0=10.0, 1-5=9.5, 6-15=9.0, 16-30=8.5, 31-50=7.5, 51-80=6.0, >80=lower
         if chips == 0:
-            chip_score = 1000.0
-        elif chips <= 2:
-            chip_score = 850.0
+            chip_score = 10.0
         elif chips <= 5:
-            chip_score = 700.0
-        elif chips <= 10:
-            chip_score = 500.0
+            chip_score = 9.5
+        elif chips <= 15:
+            chip_score = 9.0
+        elif chips <= 30:
+            chip_score = 8.5
+        elif chips <= 50:
+            chip_score = 7.5  # Was 600 - too harsh for near-mint
+        elif chips <= 80:
+            chip_score = 6.0
         else:
-            chip_score = max(100.0, 500.0 - (chips - 10) * 20.0)
+            chip_score = max(1.0, 6.0 - (chips - 80) * 0.08)
 
-        # Score max notch depth: 0-2px=1000, 2-5px=800, 5-10px=600, >10px=lower
-        if notch <= 2.0:
-            notch_score = 1000.0
-        elif notch <= 5.0:
-            notch_score = 800.0
-        elif notch <= 10.0:
-            notch_score = 600.0
+        # Score max notch depth: adjusted for high-res images
+        # For 630px card width, allow larger absolute deviation for near-mint cards
+        # 0-5px=10.0, 5-15px=9.0, 15-25px=8.0, 25-40px=7.0, 40-60px=5.0, >60px=lower
+        if notch <= 5.0:
+            notch_score = 10.0
+        elif notch <= 15.0:
+            notch_score = 9.0 + (15.0 - notch) / 10.0 * 1.0  # 9.0-10.0 linear
+        elif notch <= 25.0:
+            notch_score = 8.0 + (25.0 - notch) / 10.0 * 1.0  # 8.0-9.0 linear
+        elif notch <= 40.0:
+            notch_score = 7.0 + (40.0 - notch) / 15.0 * 1.0  # 7.0-8.0 linear
+        elif notch <= 60.0:
+            notch_score = 5.0 + (60.0 - notch) / 20.0 * 2.0  # 5.0-7.0 linear
         else:
-            notch_score = max(100.0, 600.0 - (notch - 10.0) * 30.0)
+            notch_score = max(1.0, 5.0 - (notch - 60.0) * 0.15)
 
         # Take worst of the three metrics for this edge
         edge_score = min(rms_score, chip_score, notch_score)

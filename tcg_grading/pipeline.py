@@ -52,7 +52,13 @@ async def grade_card(
         GradeReport with four sub-grades and overall grade.
     """
     # ------------------------------------------------------------------ setup
-    client = anthropic.Anthropic(api_key=api_key) if api_key else anthropic.Anthropic()
+    import os
+    base_url = os.environ.get("ANTHROPIC_BASE_URL")
+
+    if api_key:
+        client = anthropic.Anthropic(api_key=api_key, base_url=base_url) if base_url else anthropic.Anthropic(api_key=api_key)
+    else:
+        client = anthropic.Anthropic(base_url=base_url) if base_url else anthropic.Anthropic()
 
     ts = datetime.now()
     if output_dir is None:

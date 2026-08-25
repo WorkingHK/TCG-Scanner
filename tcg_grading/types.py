@@ -42,6 +42,8 @@ class DetectedCard:
     pixels_per_mm: float             # from jig calibration (or estimate)
     outer_corners: list[Point]       # four corners in rectified-image coords
     inner_frame: Optional[Polygon]   # printed image frame, for centering (None if undetected)
+    original_rgb: Optional[np.ndarray] = None           # original captured image (before rectification)
+    outer_corners_ordered: Optional[np.ndarray] = None  # quad corners in original image [tl, tr, br, bl]
 
 
 # ---------------------------------------------------------------------------
@@ -91,6 +93,7 @@ class GradeReport:
             elif criterion.error:
                 lines.append(f"  {name}: ERROR — {criterion.error}")
             else:
+                # Grades are already on 1-10 scale (PSA style)
                 lines.append(f"  {name}: {criterion.grade:.1f} ({criterion.confidence})")
         if self.overall is not None:
             lines.append(f"  OVERALL: {self.overall:.1f}")

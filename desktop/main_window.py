@@ -64,23 +64,23 @@ def _grade_color(grade: Optional[float]) -> str:
     if grade is None:
         return "#555577"
     s = grade  # Already 0-1000, no conversion needed
-    if s >= 960: return "#00e676"
-    if s >= 900: return "#69f0ae"
-    if s >= 800: return "#ffd600"
-    if s >= 600: return "#ff6d00"
+    if s >= 9: return "#00e676"
+    if s >= 8: return "#69f0ae"
+    if s >= 7: return "#ffd600"
+    if s >= 6: return "#ff6d00"
     return "#d50000"
 
 
 def _grade_tier(grade: Optional[float]) -> str:
     if grade is None:
         return "N/A"
-    s = grade  # Already 0-1000, no conversion needed
-    if s >= 970: return "GEM MINT"
-    if s >= 950: return "MINT+"
-    if s >= 900: return "MINT"
-    if s >= 850: return "NEAR MINT+"
-    if s >= 800: return "NEAR MINT"
-    if s >= 700: return "EXCELLENT"
+    # Now using 1-10 scale (PSA style)
+    if grade >= 9.7: return "GEM MINT"
+    if grade >= 9.5: return "MINT+"
+    if grade >= 9.0: return "MINT"
+    if grade >= 8.5: return "NEAR MINT+"
+    if grade >= 8.0: return "NEAR MINT"
+    if grade >= 7.0: return "EXCELLENT"
     return "POOR"
 
 
@@ -205,6 +205,13 @@ class GradeWorker(QThread):
         try:
             if self.api_key:
                 os.environ["ANTHROPIC_API_KEY"] = self.api_key
+
+            # Ensure ANTHROPIC_BASE_URL is set for the worker thread
+            if "ANTHROPIC_BASE_URL" not in os.environ:
+                # Try to get from main process or use default proxy
+                base_url = os.environ.get("ANTHROPIC_BASE_URL", "https://cc.zhihuiapi.top")
+                os.environ["ANTHROPIC_BASE_URL"] = base_url
+
             report = asyncio.run(grade_card(
                 image_path=self.image_path,
                 use_camera=self.use_camera,

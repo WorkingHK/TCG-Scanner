@@ -23,7 +23,7 @@ def grade_centering(card: DetectedCard) -> CriterionGrade:
     """
     if card.inner_frame is None:
         return CriterionGrade(
-            grade=100.0,  # 0-1000 scale
+            grade=1.0,  # 1-10 scale
             confidence="low",
             evidence={"error": "Inner frame not detected; centering cannot be measured"},
             annotated_crop_path=None,
@@ -32,18 +32,37 @@ def grade_centering(card: DetectedCard) -> CriterionGrade:
 
     try:
         h, w = card.rgb.shape[:2]
-        pts = np.array(card.inner_frame.points, dtype=np.float32)
 
-        # Bounding box of inner frame
+        # Detect actual card boundary by finding non-black regions
+        # Black PLA background has very low intensity (< 30 in all channels)
+        gray = cv2.cvtColor(card.rgb, cv2.COLOR_RGB2GRAY)
+        _, mask = cv2.threshold(gray, 30, 255, cv2.THRESH_BINARY)
+
+        # Find the bounding box of non-black pixels (the actual card)
+        coords = cv2.findNonZero(mask)
+        if coords is not None:
+            x, y, card_w, card_h = cv2.boundingRect(coords)
+            card_x_min = float(x)
+            card_x_max = float(x + card_w)
+            card_y_min = float(y)
+            card_y_max = float(y + card_h)
+        else:
+            # Fallback: use full image
+            card_x_min, card_y_min = 0.0, 0.0
+            card_x_max, card_y_max = float(w), float(h)
+
+        # Inner frame bounding box
+        pts = np.array(card.inner_frame.points, dtype=np.float32)
         frame_x_min = float(pts[:, 0].min())
         frame_x_max = float(pts[:, 0].max())
         frame_y_min = float(pts[:, 1].min())
         frame_y_max = float(pts[:, 1].max())
 
-        left   = frame_x_min
-        right  = w - frame_x_max
-        top    = frame_y_min
-        bottom = h - frame_y_max
+        # Calculate borders between inner frame and card edge (not image edge)
+        left   = frame_x_min - card_x_min
+        right  = card_x_max - frame_x_max
+        top    = frame_y_min - card_y_min
+        bottom = card_y_max - frame_y_max
 
         if left + right <= 0 or top + bottom <= 0:
             raise ValueError("Degenerate frame margins")
@@ -89,7 +108,7 @@ def grade_centering(card: DetectedCard) -> CriterionGrade:
     except Exception as exc:
         log.exception("Centering grading failed")
         return CriterionGrade(
-            grade=100.0,  # 0-1000 scale
+            grade=1.0,  # 1-10 scale
             confidence="low",
             evidence={"exception": str(exc)},
             annotated_crop_path=None,

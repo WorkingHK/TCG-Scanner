@@ -34,7 +34,96 @@ def _order_corners(pts: np.ndarray) -> np.ndarray:
     return rect
 
 
-def _find_card_contour(gray: np.ndarray) -> Optional[np.ndarray]:
+def _find_card_edge_from_black_background(rgb: np.ndarray) -> Optional[np.ndarray]:
+    """
+    Find the TRUE card edge by detecting where the card meets the black background.
+
+    This filters out the black PLA frame first, then finds the boundary between
+    card and background. This captures the actual physical edge including the
+    silver/grey card border.
+
+    Returns:
+        4-point quadrilateral of the true card edge, or None if not found
+    """
+    h, w = rgb.shape[:2]
+    img_area = h * w
+
+    # Convert to HSV for better black detection
+    hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
+    gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+
+    # Method 1: Detect black background using brightness + saturation
+    # Black PLA: low brightness AND low saturation
+    # Relaxed thresholds to work with various lighting conditions
+    v_channel = hsv[:, :, 2]
+    s_channel = hsv[:, :, 1]
+
+    # More lenient threshold: V < 80 (was 60), S < 70 (was 50)
+    black_mask = (v_channel < 80) & (s_channel < 70)
+    black_mask = black_mask.astype(np.uint8) * 255
+
+    # Check if we actually detected significant black area (at least 5% of image)
+    black_area_pct = (black_mask > 0).sum() / img_area * 100
+    log.info(f"Black background detected: {black_area_pct:.1f}% of image")
+
+    if black_area_pct < 5:
+        log.warning(f"Insufficient black background detected ({black_area_pct:.1f}%), skipping black background method")
+        return None
+
+    # Clean up the mask
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+    black_mask = cv2.morphologyEx(black_mask, cv2.MORPH_CLOSE, kernel, iterations=3)
+    black_mask = cv2.morphologyEx(black_mask, cv2.MORPH_OPEN, kernel, iterations=2)
+
+    # Invert: 255 = card, 0 = black background
+    card_mask = cv2.bitwise_not(black_mask)
+
+    # Find the card contour from this mask
+    contours, _ = cv2.findContours(card_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    if not contours:
+        log.warning("No contours found in card mask")
+        return None
+
+    # Find largest contour (should be the card)
+    contours = sorted(contours, key=cv2.contourArea, reverse=True)
+
+    for cnt in contours[:3]:
+        area = cv2.contourArea(cnt)
+        area_pct = area / img_area * 100
+
+        # Skip if too small or too large
+        if area_pct < 10 or area_pct > 95:
+            continue
+
+        peri = cv2.arcLength(cnt, True)
+
+        # Try multiple epsilon values for polygon approximation
+        for epsilon_factor in [0.02, 0.015, 0.01, 0.005]:
+            approx = cv2.approxPolyDP(cnt, epsilon_factor * peri, True)
+
+            if len(approx) == 4:
+                rect = cv2.minAreaRect(approx)
+                w_rect, h_rect = rect[1]
+                if w_rect > 0 and h_rect > 0:
+                    aspect = max(w_rect, h_rect) / min(w_rect, h_rect)
+                    if 1.0 <= aspect <= 2.0:
+                        log.info(f"Found card edge from black background: area={area_pct:.1f}%, aspect={aspect:.2f}")
+                        return approx.reshape(4, 2).astype(np.float32)
+
+        # Fallback: use minAreaRect
+        if area_pct > 20:
+            rect = cv2.minAreaRect(cnt)
+            w_rect, h_rect = rect[1]
+            if w_rect > 0 and h_rect > 0:
+                aspect = max(w_rect, h_rect) / min(w_rect, h_rect)
+                if 1.0 <= aspect <= 2.0:
+                    log.info(f"Found card edge via minAreaRect from black mask: area={area_pct:.1f}%, aspect={aspect:.2f}")
+                    box = cv2.boxPoints(rect)
+                    return box.astype(np.float32)
+
+    log.warning("Could not find valid card quadrilateral from black background mask")
+    return None
     """Find the largest quadrilateral contour that looks like a card."""
     # Blur + Canny
     blurred = cv2.GaussianBlur(gray, (5, 5), 0)
@@ -241,15 +330,18 @@ def _detect_inner_frame(rectified: np.ndarray) -> Optional[Polygon]:
             best_area = area
 
     if best is None:
-        # Fallback: use standard Pokemon card proportions to estimate inner frame.
-        # On a 63×88 mm card the artwork window is ~53×39 mm starting ~4.5 mm from
-        # the top and centred horizontally.  Scale to canonical pixel dimensions.
+        # Fallback: use standard card proportions to estimate inner frame.
+        # For centering measurement, we need the full printed area, not just artwork.
+        # Standard card has roughly equal borders on all sides (~4-5mm).
         log.info("Inner frame contour not found — falling back to proportion-based estimate.")
-        # Proportional bounds (empirically derived for standard Pokemon card layout)
-        l = int(w * 0.075)   # ~4.7 mm left border
-        r = int(w * 0.925)   # symmetric
-        t = int(h * 0.095)   # ~8.4 mm top border (name bar + top border)
-        b = int(h * 0.640)   # artwork bottom (above HP / type row)
+        # Proportional bounds - equal borders on all sides for centering
+        border_x = 0.075  # ~4.7mm side borders
+        border_y = 0.095  # ~8.4mm top border
+        # For bottom, use symmetric border (same as top approximately)
+        l = int(w * border_x)
+        r = int(w * (1.0 - border_x))
+        t = int(h * border_y)
+        b = int(h * (1.0 - border_y))  # Changed from 0.640 to 1.0-border_y for symmetry
         pts = np.array([[l, t], [r, t], [r, b], [l, b]], dtype=np.float32)
         ordered = _order_corners(pts)
         return Polygon(points=[(int(p[0]), int(p[1])) for p in ordered])
@@ -277,56 +369,61 @@ def detect_card(card_image: CardImage, pixels_per_mm: Optional[float] = None) ->
     """
     rgb = card_image.rgb
 
-    # Try blue background masking first
-    blue_mask = _mask_blue_background(rgb)
-    # Find contours on the mask
-    contours, _ = cv2.findContours(blue_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    # PRIORITY 1: Try black background filtering first (most accurate for true edge)
+    quad = _find_card_edge_from_black_background(rgb)
+    blue_mask = None  # Initialize for later card presence check
 
-    quad = None
-    if contours:
-        # Try to find card quad from mask contours
-        contours = sorted(contours, key=cv2.contourArea, reverse=True)
-        img_area = blue_mask.shape[0] * blue_mask.shape[1]
+    # PRIORITY 2: Try multi-method masking
+    if quad is None:
+        log.info("Black background detection failed, trying multi-method masking")
+        blue_mask = _mask_blue_background(rgb)
+        # Find contours on the mask
+        contours, _ = cv2.findContours(blue_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-        for cnt in contours[:5]:
-            area = cv2.contourArea(cnt)
-            if area < img_area * 0.05:  # relaxed threshold for mask
-                break
+        if contours:
+            # Try to find card quad from mask contours
+            contours = sorted(contours, key=cv2.contourArea, reverse=True)
+            img_area = blue_mask.shape[0] * blue_mask.shape[1]
 
-            peri = cv2.arcLength(cnt, True)
+            for cnt in contours[:5]:
+                area = cv2.contourArea(cnt)
+                if area < img_area * 0.05:  # relaxed threshold for mask
+                    break
 
-            # Try multiple epsilon values for polygon approximation
-            for epsilon_factor in [0.02, 0.01, 0.005, 0.001]:
-                approx = cv2.approxPolyDP(cnt, epsilon_factor * peri, True)
+                peri = cv2.arcLength(cnt, True)
 
-                if len(approx) == 4:
-                    rect = cv2.minAreaRect(approx)
+                # Try multiple epsilon values for polygon approximation
+                for epsilon_factor in [0.02, 0.01, 0.005, 0.001]:
+                    approx = cv2.approxPolyDP(cnt, epsilon_factor * peri, True)
+
+                    if len(approx) == 4:
+                        rect = cv2.minAreaRect(approx)
+                        w, h = rect[1]
+                        if w > 0 and h > 0:
+                            aspect = max(w, h) / min(w, h)
+                            if 1.0 <= aspect <= 2.0:  # relaxed from 1.2-1.6
+                                log.info(f"Found card via mask: area={area:.0f} ({area/img_area*100:.1f}%), aspect={aspect:.2f}, epsilon={epsilon_factor}")
+                                quad = approx.reshape(4, 2).astype(np.float32)
+                                break
+
+                if quad is not None:
+                    break
+
+                # If no 4-corner approx worked, try minAreaRect (oriented bounding box)
+                if area >= img_area * 0.1:  # only for large contours
+                    rect = cv2.minAreaRect(cnt)
                     w, h = rect[1]
                     if w > 0 and h > 0:
                         aspect = max(w, h) / min(w, h)
-                        if 1.0 <= aspect <= 2.0:  # relaxed from 1.2-1.6
-                            log.info(f"Found card via mask: area={area:.0f} ({area/img_area*100:.1f}%), aspect={aspect:.2f}, epsilon={epsilon_factor}")
-                            quad = approx.reshape(4, 2).astype(np.float32)
+                        if 1.0 <= aspect <= 2.0:
+                            log.info(f"Found card via minAreaRect: area={area:.0f} ({area/img_area*100:.1f}%), aspect={aspect:.2f}")
+                            # Get the 4 corners of the rotated rect
+                            box = cv2.boxPoints(rect)
+                            quad = box.astype(np.float32)
+                            log.info(f"minAreaRect corners (raw): {quad.tolist()}")
                             break
 
-            if quad is not None:
-                break
-
-            # If no 4-corner approx worked, try minAreaRect (oriented bounding box)
-            if area >= img_area * 0.1:  # only for large contours
-                rect = cv2.minAreaRect(cnt)
-                w, h = rect[1]
-                if w > 0 and h > 0:
-                    aspect = max(w, h) / min(w, h)
-                    if 1.0 <= aspect <= 2.0:
-                        log.info(f"Found card via minAreaRect: area={area:.0f} ({area/img_area*100:.1f}%), aspect={aspect:.2f}")
-                        # Get the 4 corners of the rotated rect
-                        box = cv2.boxPoints(rect)
-                        quad = box.astype(np.float32)
-                        log.info(f"minAreaRect corners (raw): {quad.tolist()}")
-                        break
-
-    # Fallback: try edge detection on grayscale
+    # PRIORITY 3: Fallback to edge detection on grayscale
     if quad is None:
         log.info("Mask detection failed, trying edge detection")
         gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
@@ -339,13 +436,11 @@ def detect_card(card_image: CardImage, pixels_per_mm: Optional[float] = None) ->
     ordered = _order_corners(quad)
     log.info(f"Quad after ordering: {ordered.tolist()}")
 
-    # Expand the quadrilateral outward to capture the TRUE outermost edge
-    # The card detection finds the card outline, but often stops at the inner edge
-    # of the white border, not the actual physical edge touching the frame.
-
-    # Strategy: Expand moderately (30px) to capture outer edge while preserving
-    # corners that are already working
-    EXPANSION_PX = 5  # Increased from 10 to go further outward
+    # Black background detection finds the card+border boundary.
+    # For corner grading: we extract from original image at quad vertices (perfect).
+    # For edge/surface grading: rectified image should contain ONLY card, no black background.
+    # Apply NEGATIVE expansion (shrink inward) to exclude black frame entirely.
+    EXPANSION_PX = -10  # Shrink 10px inward to fully exclude black frame
 
     # Calculate the center and expand each corner away from it
     center = ordered.mean(axis=0)
@@ -383,6 +478,10 @@ def detect_card(card_image: CardImage, pixels_per_mm: Optional[float] = None) ->
         log.warning(f"Detected region is {contour_area_pct:.1f}% of image — likely image boundary. Checking card presence...")
         # Don't immediately reject - let card presence check decide
 
+    # Create a dummy mask for card presence check if we used black background detection
+    if blue_mask is None:
+        blue_mask = np.ones((rgb.shape[0], rgb.shape[1]), dtype=np.uint8) * 255
+
     if not _check_card_present(rectified, blue_mask, contour_area_pct):
         if contour_area_pct > 95:
             raise ValueError("Card detection found image boundary instead of card edges. Ensure card has contrasting background and doesn't fill entire frame.")
@@ -404,4 +503,6 @@ def detect_card(card_image: CardImage, pixels_per_mm: Optional[float] = None) ->
         pixels_per_mm=pixels_per_mm,
         outer_corners=outer_corners,
         inner_frame=inner_frame,
+        original_rgb=rgb,  # Pass through original image for corner extraction
+        outer_corners_ordered=ordered,  # Pass through quad corners in original image coords
     )

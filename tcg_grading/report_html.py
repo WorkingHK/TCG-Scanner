@@ -1,7 +1,7 @@
 """
-Generate a TAG Portal-style HTML grading report from a GradeReport.
+Generate a PSA-style HTML grading report from a GradeReport.
 
-TAG scoring uses 0–1000 scale. We convert the pipeline's 1–10 grades
+PSA scoring uses 0–1000 scale. We convert the pipeline's 1–10 grades
 to 0–1000 and mirror the portal's visual layout as closely as possible.
 """
 from __future__ import annotations
@@ -19,57 +19,57 @@ from .report_cv_breakdown import _cv_metrics_breakdown
 # Grade is already on 0-1000 scale, no conversion needed
 # ---------------------------------------------------------------------------
 
-def _to_tag(grade: Optional[float]) -> Optional[int]:
+def _to_score_1000(grade: Optional[float]) -> Optional[int]:
     """Grade is already 0-1000, just round to int."""
     if grade is None:
         return None
     return int(round(grade))
 
 
-def _tag_str(grade: Optional[float], default: str = "—") -> str:
-    v = _to_tag(grade)
+def _score_str(grade: Optional[float], default: str = "—") -> str:
+    v = _to_score_1000(grade)
     return str(v) if v is not None else default
 
 
 # ---------------------------------------------------------------------------
-# Colour mapping (mirrors TAG's green/amber/red system)
+# Colour mapping (mirrors PSA green/amber/red system)
 # ---------------------------------------------------------------------------
 
-def _color(tag_score) -> str:
-    if tag_score is None:
+def _color(score_1000) -> str:
+    if score_1000 is None:
         return "#555577"
     try:
-        tag_score = int(tag_score)
+        score_1000 = int(score_1000)
     except (TypeError, ValueError):
         return "#888899"  # string value like '48L/52R'
-    if tag_score >= 960:
+    if score_1000 >= 960:
         return "#00e676"
-    if tag_score >= 900:
+    if score_1000 >= 900:
         return "#69f0ae"
-    if tag_score >= 800:
+    if score_1000 >= 800:
         return "#ffd600"
-    if tag_score >= 600:
+    if score_1000 >= 600:
         return "#ff6d00"
     return "#d50000"
 
 
-def _grade_tier(tag_score: Optional[int]) -> str:
-    if tag_score is None:
+def _grade_tier(grade_10: Optional[float]) -> str:
+    """Return grade tier label based on 1-10 scale score."""
+    if grade_10 is None:
         return "N/A"
-    if tag_score >= 970:
+    # Using 1-10 scale thresholds (PSA style)
+    if grade_10 >= 9.7:
         return "GEM MINT"
-    if tag_score >= 950:
+    if grade_10 >= 9.5:
         return "MINT+"
-    if tag_score >= 900:
+    if grade_10 >= 9.0:
         return "MINT"
-    if tag_score >= 850:
+    if grade_10 >= 8.5:
         return "NEAR MINT+"
-    if tag_score >= 800:
+    if grade_10 >= 8.0:
         return "NEAR MINT"
-    if tag_score >= 700:
+    if grade_10 >= 7.0:
         return "EXCELLENT"
-    if tag_score >= 500:
-        return "VERY GOOD"
     return "POOR"
 
 
@@ -94,11 +94,11 @@ def _b64(path: Optional[Path | str]) -> str:
 
 def _derive_sub_scores(grade: Optional[float]) -> dict:
     """
-    Derive TAG-style sub-scores (Fray, Fill, CSW/ESW, Angle) from the
+    Derive PSA-style sub-scores (Fray, Fill, CSW/ESW, Angle) from the
     overall criterion grade.  These are estimates until per-component
     CV metrics are available.
     """
-    base = _to_tag(grade)
+    base = _to_score_1000(grade)
     if base is None:
         return {}
     # Small variance to make it look realistic
@@ -161,7 +161,7 @@ def _corner_grid(corners_c: Optional[CriterionGrade], capture_path: Optional[Pat
     if corners_c is None or corners_c.error:
         return '<div class="corner-grid-empty">Corner data unavailable</div>'
 
-    base = _to_tag(corners_c.grade)
+    base = _to_score_1000(corners_c.grade)
     per_corner = corners_c.evidence.get("vlm_response", {}).get("per_corner", {})
 
     def corner_card(pos_label: str, corner_key: str, corner_num: int) -> str:
@@ -207,7 +207,7 @@ def _edge_grid(edges_c: Optional[CriterionGrade], capture_path: Optional[Path]) 
     if edges_c is None or edges_c.error:
         return '<div class="corner-grid-empty">Edge data unavailable</div>'
 
-    base = _to_tag(edges_c.grade)
+    base = _to_score_1000(edges_c.grade)
     per_edge = edges_c.evidence.get("per_edge", {})
 
     def edge_card(label: str, key: str, edge_num: int) -> str:
@@ -261,7 +261,7 @@ def generate_report(
     output_path: Optional[str | Path] = None,
 ) -> str:
     """
-    Build a TAG Portal-style HTML report from a GradeReport.
+    Build a PSA-style HTML report from a GradeReport.
 
     Parameters
     ----------
@@ -288,17 +288,17 @@ def generate_report(
         '<div class="card-img-placeholder">📷</div>'
     )
 
-    # Overall TAG score
-    overall_tag  = _to_tag(report.overall)
-    overall_str  = str(overall_tag) if overall_tag is not None else "—"
-    overall_tier = _grade_tier(overall_tag)
-    overall_col  = _color(overall_tag)
+    # Overall grade
+    overall_score  = _to_score_1000(report.overall)
+    overall_str  = str(overall_score) if overall_score is not None else "—"
+    overall_tier = _grade_tier(report.overall)  # Pass 1-10 grade directly, not converted
+    overall_col  = _color(overall_score)
 
-    # Criterion TAG scores
-    ct = _to_tag(report.centering.grade if report.centering and not report.centering.error else None)
-    co = _to_tag(report.corners.grade   if report.corners   and not report.corners.error   else None)
-    ed = _to_tag(report.edges.grade     if report.edges     and not report.edges.error     else None)
-    su = _to_tag(report.surface.grade   if report.surface   and not report.surface.error   else None)
+    # Criterion grades
+    ct = _to_score_1000(report.centering.grade if report.centering and not report.centering.error else None)
+    co = _to_score_1000(report.corners.grade   if report.corners   and not report.corners.error   else None)
+    ed = _to_score_1000(report.edges.grade     if report.edges     and not report.edges.error     else None)
+    su = _to_score_1000(report.surface.grade   if report.surface   and not report.surface.error   else None)
 
     # Centering ratios
     lr_front, tb_front = _centering_ratios(report.centering)
@@ -326,7 +326,7 @@ def generate_report(
 <head>
 <meta charset="UTF-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>TAG Grading Report — {card_name}</title>
+<title>Card Grading Report — {card_name}</title>
 <style>
   :root {{
     --bg: #05050d;
@@ -510,7 +510,7 @@ def generate_report(
 
 <!-- Nav -->
 <div class="nav">
-  <div class="nav-logo">TAG</div>
+  <div class="nav-logo">TCG Scanner</div>
   <div class="nav-links">
     <a href="#">Home</a><a href="#">About</a><a href="#">Grading</a>
     <a href="#">Pop Report</a><a href="#">Shop</a>
@@ -526,7 +526,7 @@ def generate_report(
     <div class="score-badge">
       <div class="score-num">{overall_str}</div>
       <div class="score-tier">{overall_tier}</div>
-      <div class="score-meta">TAG SCORE</div>
+      <div class="score-meta">OVERALL GRADE</div>
       <div class="transp-row" style="margin-top:14px">
         <div class="transp-item">
           <div class="transp-label">Surface<br>Defect Transp.</div>
@@ -584,8 +584,8 @@ def generate_report(
     </div>
   </div>
 
-  <!-- TAG Grading Summary — criterion overview -->
-  <div class="section-hdr">TAG Grading Summary</div>
+  <!-- Card Grading Summary — criterion overview -->
+  <div class="section-hdr">Card Grading Summary</div>
   <div class="grading-summary-table">
     <table style="width:100%; border-collapse:collapse;">
       <thead>

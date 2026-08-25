@@ -5,7 +5,7 @@ Shows CV base score, VLM adjustment, and final grade.
 
 
 def _color(score: int) -> str:
-    """Return color for a TAG score (0-1000 scale)."""
+    """Return color for a score (1-10 scale)."""
     if score is None:
         return "#888"
     if score >= 900:
