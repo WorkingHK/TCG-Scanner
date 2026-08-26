@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import tempfile
+import time
 from abc import ABC, abstractmethod
 from datetime import datetime
 from pathlib import Path
@@ -53,9 +54,10 @@ class UVCCamera(BaseCamera):
                 "Check that the camera is connected and not in use by another app."
             )
 
-        # Request maximum resolution from the camera
-        self._cap.set(cv2.CAP_PROP_FRAME_WIDTH,  9999)
-        self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 9999)
+        # Request high resolution (but not max, as some cameras report resolutions
+        # they can't actually deliver via OpenCV - e.g., 8000×6000 fails but 4000×3000 works)
+        self._cap.set(cv2.CAP_PROP_FRAME_WIDTH,  5120)
+        self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 2880)
 
         w = int(self._cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         h = int(self._cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
@@ -63,7 +65,10 @@ class UVCCamera(BaseCamera):
 
     def live_frame(self) -> np.ndarray | None:
         """Grab a preview frame (used by the UI live preview)."""
-        ret, bgr = self._cap.read()
+        # Use grab/retrieve pattern for cameras that don't support read()
+        if not self._cap.grab():
+            return None
+        ret, bgr = self._cap.retrieve()
         if not ret or bgr is None:
             return None
         rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
@@ -78,12 +83,19 @@ class UVCCamera(BaseCamera):
         then saves as JPEG.
         """
         # Discard warm-up frames (auto-exposure / auto-white-balance settle)
+        # Use grab/retrieve pattern for cameras that don't support read()
+        # Add delay for low-fps cameras (5fps = 200ms between frames)
         for _ in range(5):
-            self._cap.read()
+            self._cap.grab()
+            time.sleep(0.25)  # 250ms ensures frame is ready at 5fps
 
-        ret, bgr = self._cap.read()
+        if not self._cap.grab():
+            raise RuntimeError("UVCCamera: failed to grab frame from camera.")
+
+        time.sleep(0.1)  # Brief pause before retrieve
+        ret, bgr = self._cap.retrieve()
         if not ret or bgr is None:
-            raise RuntimeError("UVCCamera: failed to read frame from camera.")
+            raise RuntimeError("UVCCamera: failed to retrieve frame from camera.")
 
         # Apply rotation if needed
         if self.rotate_90_cw:

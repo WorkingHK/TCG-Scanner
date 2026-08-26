@@ -46,6 +46,21 @@ def grade_centering(card: DetectedCard) -> CriterionGrade:
             card_x_max = float(x + card_w)
             card_y_min = float(y)
             card_y_max = float(y + card_h)
+
+            # Check if there's significant black background (rectification artifacts)
+            # If card boundary is more than 5% inset from image edges, assume full image is card
+            margin_threshold = 0.05
+            has_black_bg = (
+                card_x_min > w * margin_threshold or
+                card_y_min > h * margin_threshold or
+                card_x_max < w * (1 - margin_threshold) or
+                card_y_max < h * (1 - margin_threshold)
+            )
+
+            if has_black_bg:
+                log.info(f"Detected black background in rectified image (card boundary inset by {card_x_min:.0f},{card_y_min:.0f}), using full image as card boundary")
+                card_x_min, card_y_min = 0.0, 0.0
+                card_x_max, card_y_max = float(w), float(h)
         else:
             # Fallback: use full image
             card_x_min, card_y_min = 0.0, 0.0

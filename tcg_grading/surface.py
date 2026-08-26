@@ -32,46 +32,109 @@ def _encode_image(img: np.ndarray, max_px: int = CARD_MAX_PX) -> str:
 
 def _detect_surface_defects(rgb: np.ndarray) -> tuple[np.ndarray, dict]:
     """
-    Pre-detect candidate surface defects using morphological ops + Hough lines.
-    Returns annotated image copy and evidence dict.
+    Smart scratch detection with background suppression and characteristic filtering.
 
-    NOTE: For holographic cards, these metrics will have many false positives.
-    Thresholds are relaxed to reduce sensitivity to holo patterns.
+    Reduces false positives from:
+    - Complex artwork and printed details
+    - Holographic patterns
+    - Card edges and borders
+
+    Improves detection of:
+    - Fine scratches on complex backgrounds
+    - Linear surface defects
+
+    Returns annotated image copy and evidence dict.
     """
     gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+    h, w = gray.shape
     annotated = rgb.copy()
     evidence: dict = {}
 
-    # --- Scratch detection via top-hat morphology ---
-    # Use larger kernel and higher threshold to reduce holo pattern false positives
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 25))
-    tophat = cv2.morphologyEx(gray, cv2.MORPH_TOPHAT, kernel)
-    # Increased threshold from 30 to 50 to reduce holo pattern sensitivity
-    _, scratch_mask = cv2.threshold(tophat, 50, 255, cv2.THRESH_BINARY)
-    scratch_pixel_count = int(np.sum(scratch_mask > 0))
+    # Step 1: CLAHE enhancement for subtle scratch visibility
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    enhanced = clahe.apply(gray)
+    blurred = cv2.GaussianBlur(enhanced, (3, 3), 0)
+
+    # Step 2: Background suppression to isolate scratches from artwork
+    # Create "clean" background by closing with large kernel
+    bg_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
+    background = cv2.morphologyEx(blurred, cv2.MORPH_CLOSE, bg_kernel)
+
+    # Subtract background to isolate scratch signal
+    scratch_isolated = cv2.absdiff(blurred, background)
+
+    # Step 3: Multi-directional scratch detection (horizontal + vertical)
+    scratch_combined = np.zeros_like(gray, dtype=np.float32)
+
+    for angle in [0, 90]:  # Horizontal and vertical scratches
+        kernel_len = 20
+        if angle == 0:
+            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_len, 1))
+        else:
+            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, kernel_len))
+
+        tophat = cv2.morphologyEx(scratch_isolated, cv2.MORPH_TOPHAT, kernel)
+        scratch_combined = np.maximum(scratch_combined, tophat.astype(np.float32))
+
+    # Step 4: Adaptive thresholding using Otsu's method
+    _, scratch_mask_otsu = cv2.threshold(
+        scratch_combined.astype(np.uint8), 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
+    )
+
+    # Step 5: Filter by scratch characteristics
+    # Real scratches are: linear, small to medium, not touching borders
+    contours, _ = cv2.findContours(scratch_mask_otsu, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    scratch_mask_filtered = np.zeros_like(scratch_mask_otsu)
+
+    real_scratch_count = 0
+    for cnt in contours:
+        area = cv2.contourArea(cnt)
+        if area < 10:  # Too small, likely noise
+            continue
+
+        x, y, bw, bh = cv2.boundingRect(cnt)
+
+        # Exclude contours touching borders (likely card edges or artifacts)
+        margin = 5
+        if x < margin or y < margin or (x + bw) > (w - margin) or (y + bh) > (h - margin):
+            continue
+
+        # Check aspect ratio (scratches are elongated)
+        aspect = max(bw, bh) / max(min(bw, bh), 1)
+        if aspect < 3:  # Not linear enough
+            continue
+
+        # Exclude very large regions (likely holographic patterns)
+        if area > 2000:
+            continue
+
+        # This is likely a real scratch
+        cv2.drawContours(scratch_mask_filtered, [cnt], -1, 255, -1)
+        real_scratch_count += 1
+
+    # Overlay filtered scratches in red
+    annotated[scratch_mask_filtered > 0] = [255, 80, 80]
+
+    scratch_pixel_count = int(np.sum(scratch_mask_filtered > 0))
     evidence["scratch_candidate_pixels"] = scratch_pixel_count
+    evidence["scratch_count"] = real_scratch_count
 
-    # Overlay scratch candidates in red
-    annotated[scratch_mask > 0] = [255, 80, 80]
-
-    # --- Print line / refractor detection via Hough ---
-    # Increased Canny thresholds and Hough threshold to reduce false positives
-    edges = cv2.Canny(gray, 50, 150)  # Was 30, 100 - too sensitive
-    lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=120, minLineLength=60, maxLineGap=15)
-    # threshold: 80 → 120 (more strict)
-    # minLineLength: 40 → 60 (only longer lines)
-    # maxLineGap: 10 → 15 (allow more gap)
+    # Step 6: Hough lines on isolated scratch image (reduces false positives)
+    edges_isolated = cv2.Canny(scratch_isolated, 30, 90)
+    lines = cv2.HoughLinesP(edges_isolated, 1, np.pi / 180, threshold=50, minLineLength=40, maxLineGap=10)
 
     line_count = 0
     if lines is not None:
         line_count = len(lines)
-        for line in lines[:20]:  # annotate first 20
+        # Annotate first 20 lines
+        for line in lines[:20]:
             x1, y1, x2, y2 = line[0]
             cv2.line(annotated, (x1, y1), (x2, y2), (80, 80, 255), 1)
+
     evidence["hough_line_count"] = line_count
 
-    # Derive a simple severity estimate for the evidence panel
-    total_px = gray.shape[0] * gray.shape[1]
+    # Calculate coverage percentage
+    total_px = h * w
     scratch_pct = scratch_pixel_count / total_px * 100
     evidence["scratch_coverage_pct"] = round(scratch_pct, 3)
 
@@ -81,51 +144,47 @@ def _detect_surface_defects(rgb: np.ndarray) -> tuple[np.ndarray, dict]:
 def _compute_cv_base_score(cv_evidence: dict) -> Optional[float]:
     """
     Compute base surface grade from CV measurements.
-    Maps scratch_coverage_pct and hough_line_count to 1-10 scale.
-    Returns None if insufficient data.
+    Uses filtered scratch count and coverage percentage.
 
-    NOTE: Scoring is relaxed for holographic cards which naturally trigger
-    more false positives due to their reflective patterns.
+    The new smart detection filters out false positives from artwork and holographic patterns,
+    so scoring is based on actual detected scratches rather than raw pixel coverage.
+
+    Returns None if insufficient data.
     """
     scratch_pct = cv_evidence.get("scratch_coverage_pct", 0)
+    scratch_count = cv_evidence.get("scratch_count", 0)
     line_count = cv_evidence.get("hough_line_count", 0)
 
-    # Score scratch coverage: adjusted for holographic cards
-    # 0-2%=10.0, 2-5%=9.0, 5-10%=8.0, 10-15%=7.0, 15-20%=6.0, 20-30%=5.0, >30%=lower
+    # Score based on filtered scratch count (more accurate than raw coverage)
+    # 0-5 scratches = pristine (10-9)
+    # 5-15 scratches = near mint (9-8)
+    # 15-30 scratches = excellent (8-7)
+    # 30-60 scratches = good (7-5)
+    # 60+ scratches = fair/poor (5-1)
+    if scratch_count <= 5:
+        scratch_score = 10.0 - (scratch_count / 5.0) * 1.0  # 10.0 to 9.0
+    elif scratch_count <= 15:
+        scratch_score = 9.0 - ((scratch_count - 5) / 10.0) * 1.0  # 9.0 to 8.0
+    elif scratch_count <= 30:
+        scratch_score = 8.0 - ((scratch_count - 15) / 15.0) * 1.0  # 8.0 to 7.0
+    elif scratch_count <= 60:
+        scratch_score = 7.0 - ((scratch_count - 30) / 30.0) * 2.0  # 7.0 to 5.0
+    else:
+        scratch_score = max(1.0, 5.0 - ((scratch_count - 60) / 40.0) * 4.0)  # 5.0 to 1.0
+
+    # Secondary check: coverage percentage (catches dense scratch clusters)
+    # 0-2% = 10, 2-5% = 9, 5-10% = 7, >10% = lower
     if scratch_pct <= 2.0:
-        scratch_score = 10.0
+        coverage_score = 10.0
     elif scratch_pct <= 5.0:
-        scratch_score = 9.0 + (5.0 - scratch_pct) / 3.0 * 1.0
+        coverage_score = 9.0 - ((scratch_pct - 2.0) / 3.0) * 1.0
     elif scratch_pct <= 10.0:
-        scratch_score = 8.0 + (10.0 - scratch_pct) / 5.0 * 1.0
-    elif scratch_pct <= 15.0:
-        scratch_score = 7.0 + (15.0 - scratch_pct) / 5.0 * 1.0
-    elif scratch_pct <= 20.0:
-        scratch_score = 6.0 + (20.0 - scratch_pct) / 5.0 * 1.0
-    elif scratch_pct <= 30.0:
-        scratch_score = 5.0 + (30.0 - scratch_pct) / 10.0 * 1.0
+        coverage_score = 8.0 - ((scratch_pct - 5.0) / 5.0) * 1.0
     else:
-        scratch_score = max(1.0, 5.0 - (scratch_pct - 30.0) * 0.12)
+        coverage_score = max(1.0, 7.0 - ((scratch_pct - 10.0) / 5.0) * 1.0)
 
-    # Score line count: adjusted for holographic cards
-    # 0-150=10.0, 150-400=9.0, 400-700=8.0, 700-1200=7.0, 1200-2000=6.0, 2000-3000=5.0, >3000=lower
-    if line_count <= 150:
-        line_score = 10.0
-    elif line_count <= 400:
-        line_score = 9.0 + (400 - line_count) / 250.0 * 1.0
-    elif line_count <= 700:
-        line_score = 8.0 + (700 - line_count) / 300.0 * 1.0
-    elif line_count <= 1200:
-        line_score = 7.0 + (1200 - line_count) / 500.0 * 1.0
-    elif line_count <= 2000:
-        line_score = 6.0 + (2000 - line_count) / 800.0 * 1.0
-    elif line_count <= 3000:
-        line_score = 5.0 + (3000 - line_count) / 1000.0 * 1.0
-    else:
-        line_score = max(1.0, 5.0 - (line_count - 3000) * 0.008)
-
-    # Take worse of the two metrics
-    base_score = min(scratch_score, line_score)
+    # Take the worse of count and coverage scores
+    base_score = min(scratch_score, coverage_score)
     return base_score
 
 
