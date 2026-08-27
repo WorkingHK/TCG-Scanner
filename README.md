@@ -1,8 +1,8 @@
 # TCG Scanner — Card Grading PoC
 
-AI-powered Pokémon card grading system using computer vision + Claude Vision API. Produces TAG Portal-style reports on a 0–1000 scale across four criteria: **Centering, Corners, Edges, Surface**.
+AI-powered Pokémon card grading system using computer vision + Claude Vision API. Produces TAG Portal-style reports on a **PSA 1–10 scale** across four criteria: **Centering, Corners, Edges, Surface**.
 
-**Version:** v0.1.3
+**Version:** v0.1.4
 
 > **Status:** Proof of Concept (investor demo target). Not production-ready. Goal is "demo-able, plausible, defensible in plain English" — not "matches PSA to the half-grade."
 
@@ -27,6 +27,32 @@ In the app:
 1. Click **⚙ Settings** → paste your Anthropic API key, choose your camera, fill card metadata
 2. Click **📷 Live Preview** → position card under camera
 3. Click **▶ GRADE** → ~10–15s later the TAG Portal HTML report opens in your browser
+
+---
+
+## What's New in v0.1.4
+
+### PSA 1-10 Scale Refactor
+- **Grading scale changed** from 1000-point to standard PSA 1-10 scale
+- **CV-driven scoring** — Computer vision calculates base scores, VLM validates and adjusts
+- More aligned with industry standard grading
+
+### Camera Improvements
+- **Low-FPS camera support** — grab/retrieve pattern with delays for 5fps cameras
+- **Reliable resolution** — Request 5120×2880 (was 9999×9999, caused USB bandwidth issues)
+- **Warm-up frames** — Proper auto-exposure/white-balance settling
+
+### Enhanced Detection
+- **50px margin** — Rectified images now 730×980 (630×880 + 50px margin) for reliable corner extraction
+- **Centering fix** — Auto-detect and ignore black background artifacts from rectification
+- **15px expansion** — Quadrilateral expansion increased for better edge capture
+
+### Surface Scratch Detection
+- **Smart filtering** — Background suppression eliminates false positives from holographic patterns
+- **Count-based scoring** — Score based on actual scratch count (5-15 = near mint) not raw coverage
+- **Characteristic filtering** — Linear scratches only, excludes artwork patterns
+
+**See full changelog:** [`CHANGELOG.md`](CHANGELOG.md)
 
 ---
 
@@ -155,7 +181,7 @@ The desktop app picks up the key from settings first, then env var as fallback.
 ### Desktop UI (recommended)
 
 ```bash
-conda activate tcgscanner
+conda activate tcg-grading
 PYTHONPATH=. python desktop/main_window.py
 ```
 
@@ -228,7 +254,7 @@ The pipeline grades on a 1.0–10.0 PSA-style scale internally; the HTML report 
 
 | 1–10 grade | TAG score | Tier |
 |---|---|---|
-| 9.7+ | 970+ | GEM MINT |
+| 10.0 | 1000 | GEM MINT |
 | 9.5 | 950 | MINT+ |
 | 9.0 | 900 | MINT |
 | 8.5 | 850 | NEAR MINT+ |

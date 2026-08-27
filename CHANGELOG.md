@@ -4,7 +4,98 @@ All notable changes to this project will be documented in this file.
 
 ---
 
-## [v0.1.2] - 2026-06-11 (In Progress)
+## [v0.1.4] - 2026-08-26
+
+### Added
+- **Detection comparison test** — `test_improved_detection.py` comparing reference document approach vs current TCG Scanner detection
+  - Tests Canny edge detection with multi-epsilon approximation
+  - Tests adaptive threshold + morphology
+  - Validates current black background detection superiority
+  - Documentation: `test_results_analysis.md`
+
+- **Platform compatibility documentation** — Identified install.sh limitations
+  - macOS only (Apple Silicon and Intel supported)
+  - Missing Linux/Raspberry Pi support
+  - Missing aarch64 architecture detection
+  - Documented in CLAUDE.md
+
+- **Background frame analysis** — Evaluated black PLA vs alternatives
+  - Black: professional but low contrast with dark cards
+  - Green/Blue: recommended for universal contrast
+  - Grey: neutral professional alternative
+
+### Changed
+- **Grading scale refactor** — Changed from 1000-point to **PSA 1-10 scale**
+  - Centering: 1-10 based on PSA 2025 tolerances
+  - Corners/Edges/Surface: CV base score 1-10, VLM adjusts ±50 points
+  - Final grade: min(all) + 0.5 if all others ≥ min+1
+  - More aligned with industry standard
+
+- **Camera capture method** — Improved reliability for low-FPS cameras
+  - Use grab/retrieve pattern instead of direct read()
+  - Add 250ms delays between frames for 5fps cameras
+  - Request 5120×2880 resolution (was 9999×9999)
+  - File: `tcg_grading/capture.py`
+
+- **Rectified image margin** — Increased to **50px** (was implicit/undocumented)
+  - Output: 730×980 (630×880 canonical + 50px margin)
+  - Critical for corner extraction from true edge
+  - File: `tcg_grading/detect.py` (MARGIN=50)
+
+- **Quadrilateral expansion** — Increased to **15px** (was 10px)
+  - Better captures true physical edge
+  - File: `tcg_grading/detect.py` (EXPANSION_PX=15)
+
+- **Surface scratch detection** — Smart filtering algorithm (major improvement)
+  - Background suppression: removes false positives from artwork/holo patterns
+  - Count-based scoring: score by actual scratch count, not pixel coverage
+  - Characteristic filtering: linear scratches only (aspect ratio ≥3:1)
+  - Otsu thresholding: adaptive threshold calculation
+  - File: `tcg_grading/surface.py`
+
+- **Surface scoring algorithm** — Count-based instead of coverage-based
+  - 0-5 scratches: 10-9 (Pristine)
+  - 5-15 scratches: 9-8 (Near Mint)
+  - 15-30 scratches: 8-7 (Excellent)
+  - 30-60 scratches: 7-5 (Good)
+  - 60+ scratches: 5-1 (Fair/Poor)
+
+### Fixed
+- **Centering black background artifacts** — Auto-detect and ignore rectification artifacts
+  - Detects when card boundary is inset >5% from image edges
+  - Falls back to full image as card boundary
+  - File: `tcg_grading/centering.py`
+
+- **Camera frame retrieval** — More robust for low-bandwidth USB cameras
+  - Prevents "failed to grab" errors
+  - Handles cameras that don't support read() directly
+
+### Documentation
+- Added Chinese OpenCV reference document (`Brainstorm/ref.md`)
+- Added detection comparison analysis (`test_results_analysis.md`)
+- Updated CLAUDE.md: v0.1.4, tcg-grading env name, camera details, platform support
+- Updated README.md: v0.1.4 changes, PSA 1-10 scale
+
+---
+
+## [v0.1.3] - 2026-08-25
+
+### Added
+- **One-click installer** — `install.sh` for automated setup
+  - Detects architecture (macOS arm64/x86_64)
+  - Installs Miniforge if needed
+  - Creates conda environment
+  - Generates desktop launcher
+
+### Changed
+- **CV-driven grading** — CV metrics calculate base score, VLM validates
+  - CV provides objective measurements
+  - VLM adjusts ±50 points on 1000-point scale
+  - More consistent and defensible scores
+
+---
+
+## [v0.1.2] - 2026-06-11
 
 ### Added
 - **Corner radius measurement** — Measures actual corner radius against Pokemon card 3mm standard

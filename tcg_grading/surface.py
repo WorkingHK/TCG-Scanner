@@ -127,9 +127,11 @@ def _detect_surface_defects(rgb: np.ndarray) -> tuple[np.ndarray, dict]:
     if lines is not None:
         line_count = len(lines)
         # Annotate first 20 lines
-        for line in lines[:20]:
-            x1, y1, x2, y2 = line[0]
-            cv2.line(annotated, (x1, y1), (x2, y2), (80, 80, 255), 1)
+        # OpenCV 4.x returns shape (N, 1, 4); OpenCV 5.x returns flat (N, 4).
+        # Reshape defensively so unpacking works regardless of version.
+        for line in lines[:20].reshape(-1, 4):
+            x1, y1, x2, y2 = line
+            cv2.line(annotated, (int(x1), int(y1)), (int(x2), int(y2)), (80, 80, 255), 1)
 
     evidence["hough_line_count"] = line_count
 

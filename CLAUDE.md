@@ -1,7 +1,7 @@
 # TCG Scanner — Agent Reference
 
 **Project:** TCG Scanner PoC — AI-powered Pokemon card grading  
-**Version:** v0.1.3  
+**Version:** v0.1.4  
 **Status:** Proof of Concept for investor demo
 
 ---
@@ -20,12 +20,12 @@ conda activate tcgscanner
 ## Environment Requirements
 
 - **Python:** 3.11 via conda (not system Python)
-- **Conda env name:** `tcgscanner`
+- **Conda env name:** `tcg-grading`
 - **Dependencies:** Defined in `environment.yml` (never use pip outside the env)
 - **Setup on new machine:**
   ```bash
   conda env create -f environment.yml
-  conda activate tcgscanner
+  conda activate tcg-grading
   ```
 
 **Why conda:** User explicitly requested conda for this project (differs from other projects like OrangePi deployment which run without venvs).
@@ -67,13 +67,13 @@ docs/
 
 ### Run Desktop App
 ```bash
-conda activate tcgscanner
+conda activate tcg-grading
 PYTHONPATH=. python desktop/main_window.py
 ```
 
 ### Run Tests
 ```bash
-conda activate tcgscanner
+conda activate tcg-grading
 pytest                           # All tests
 pytest tests/test_detect.py      # Single module
 pytest -v -s                     # Verbose with print output
@@ -98,7 +98,7 @@ print(report.summary())
 
 ### Check Camera Index
 ```bash
-conda activate tcgscanner
+conda activate tcg-grading
 python -c "
 from tcg_grading.capture import UVCCamera
 UVCCamera.list_devices()
@@ -111,13 +111,14 @@ UVCCamera.list_devices()
 
 | File | Key Constants/Functions |
 |------|-------------------------|
-| `tcg_grading/detect.py` | `CANONICAL_WIDTH=630`, `CANONICAL_HEIGHT=880`, `EXPANSION_PX=10`, `detect_card()` |
+| `tcg_grading/detect.py` | `CANONICAL_WIDTH=630`, `CANONICAL_HEIGHT=880`, `EXPANSION_PX=15`, `MARGIN=50`, `detect_card()` |
 | `tcg_grading/corners.py` | `CORNER_CROP_PX=60`, `CORNER_INSET_PX=0`, `_measure_corner()` (3mm radius measurement) |
 | `tcg_grading/edges.py` | `EDGE_STRIP_HEIGHT=70`, `EDGE_INSET_PX=0`, `grade_edges()` |
 | `tcg_grading/centering.py` | `PSA_2025_TOLERANCES` (centering thresholds), `grade_centering()` |
+| `tcg_grading/surface.py` | Smart scratch detection with background suppression, count-based scoring |
 | `tcg_grading/rubric.py` | `CORNERS_RUBRIC`, `EDGES_RUBRIC`, `SURFACE_RUBRIC` (VLM prompts) |
 | `tcg_grading/final_grade.py` | `compute_final_grade()` (min + 0.5 if all ≥ min+1) |
-| `tcg_grading/capture.py` | `UVCCamera` (48MP USB camera), `MockCamera` (test fixtures) |
+| `tcg_grading/capture.py` | `UVCCamera` (48MP USB camera, grab/retrieve pattern, 5120×2880), `MockCamera` (test fixtures) |
 | `desktop/main_window.py` | `SettingsDialog` (API key, camera_index, rotate_90_cw) |
 
 ---
@@ -139,6 +140,8 @@ UVCCamera.list_devices()
 
 - **Hardware:** 48MP USB/UVC camera
 - **Driver:** OpenCV VideoCapture (no gphoto2)
+- **Capture method:** grab/retrieve pattern with delays for low-FPS cameras (5fps = 200ms per frame)
+- **Resolution:** 5120×2880 (was 9999×9999 - more reliable for USB bandwidth)
 - **Rotation:** v0.1.1 added 90° clockwise rotation toggle (Settings UI) for sideways-mounted cameras
 - **Index:** Built-in=0, first USB=1, second USB=2 (check with `UVCCamera.list_devices()`)
 
@@ -147,18 +150,20 @@ UVCCamera.list_devices()
 ## Detection & Grading Pipeline
 
 1. **Capture/Load:** Image from camera, file, or fixtures
-2. **Detect & Rectify:** `detect_card()` → perspective transform to 630×880px canonical size
+2. **Detect & Rectify:** `detect_card()` → perspective transform to 630×880px canonical size + 50px margin
    - Multi-method masking: edges, brightness, adaptive threshold, saturation
-   - **Quadrilateral expansion (10px):** Pushes detected boundary outward to capture true physical edge
+   - **Quadrilateral expansion (15px):** Pushes detected boundary outward to capture true physical edge
+   - **50px margin:** Added around rectified image for reliable corner detection
    - Card presence validation: rejects empty frames (low edge variance)
    - minAreaRect fallback for irregular contours
    - Inner frame detection (artwork border) with proportion-based fallback
-3. **Centering (CV only):** Measure inner frame offset vs PSA 2025 tolerances → grade 0–10
+3. **Centering (CV only):** Measure inner frame offset vs PSA 2025 tolerances → grade 1–10
+   - Detects and ignores black background artifacts from rectification (v0.1.4)
 4. **Parallel grading (CV+VLM):**
    - **Corners:** Extract 4 corner crops (60×60px from [0,0]) → CV radius measurement (3mm standard) + edge metrics → VLM grades with rubric
    - **Edges:** Extract 4 edge strips (70px from [0]) → CV metrics (straightness, wear) → VLM grades
-   - **Surface:** Full card crop → CV metrics (scratch detection, holographic uniformity) → VLM grades
-5. **Final Grade:** `min(all 4) + 0.5` if all others ≥ min+1, else `min(all 4)`
+   - **Surface:** Full card crop → CV metrics (smart scratch detection with background suppression, count-based scoring) → VLM grades
+5. **Final Grade:** `min(all 4) + 0.5` if all others ≥ min+1, else `min(all 4)` (PSA 1-10 scale)
 6. **Report:** Save crops + JSON + HTML to `captures/YYYY-MM-DD/HHMMSS/`
 
 ---
@@ -176,8 +181,9 @@ UVCCamera.list_devices()
 - Goal: Capture the actual card border edge
 
 **Quadrilateral Expansion (`tcg_grading/detect.py`):**
-- Expansion: 10px outward from detected card boundary
-- Why: Card detection often stops at inner edge of white border; expansion ensures rectified image includes the true physical corner
+- Expansion: 15px outward from detected card boundary
+- Margin: 50px added around rectified image (730×980 total output)
+- Why: Card detection often stops at inner edge of white border; expansion + margin ensures rectified image includes the true physical corner
 - Applied before perspective transform in `detect_card()`
 
 **Background Frame:**
@@ -214,7 +220,7 @@ UVCCamera.list_devices()
 
 ### Conda env not activating
 - **Check conda:** `which conda` (should be miniforge3)
-- **Recreate env:** `conda env remove -n tcgscanner && conda env create -f environment.yml`
+- **Recreate env:** `conda env remove -n tcg-grading && conda env create -f environment.yml`
 
 ### API key errors
 - **Check key:** Settings UI → paste Anthropic API key
@@ -224,11 +230,31 @@ UVCCamera.list_devices()
 
 ## Hard Rules
 
-1. **Always use conda env** — Never run Python commands without `conda activate tcgscanner`
+1. **Always use conda env** — Never run Python commands without `conda activate tcg-grading`
 2. **Never pip install outside env** — Add deps to `environment.yml` then `conda env update -f environment.yml`
 3. **PYTHONPATH=. for desktop app** — Required for imports to work
 4. **API key required** — Either in Settings UI or `ANTHROPIC_API_KEY` env var
 5. **Card presence validation** — Empty frames are rejected (don't try to grade blue racks!)
+
+---
+
+## Installation & Platform Support
+
+**Supported Platforms:**
+- ✅ macOS (Apple Silicon M1/M2/M3)
+- ✅ macOS (Intel x86_64)
+- ❌ Raspberry Pi 5 (install.sh needs Linux support - use manual setup)
+- ❌ Linux (install.sh is macOS-only - use manual setup)
+- ❌ Windows (not supported)
+
+**Install.sh limitations (as of 2026-08-26):**
+- Only detects macOS architectures (arm64, x86_64)
+- Missing OS detection (no Linux support)
+- Missing aarch64 architecture (Raspberry Pi)
+- Creates .command launcher (macOS only)
+- Assumes rsync available
+
+**For Raspberry Pi 5 demo deployment:** Use manual conda setup until install-linux.sh is created.
 
 ---
 
@@ -257,7 +283,26 @@ UVCCamera.list_devices()
 - **v0.1.0** (2026-06-08): Initial release — full grading pipeline
 - **v0.1.1** (2026-06-10): Camera rotation toggle, improved detection (multi-method masking, card presence validation, minAreaRect fallback)
 - **v0.1.2** (2026-06-11): Corner radius measurement (3mm standard), corner/edge capture from outermost edge (60×60px corners, 70px edges, no inset), 10px quad expansion for true physical corner capture, black frame support
-- **v0.1.3** (2026-06-11): CV-driven grading with VLM validation — CV metrics calculate base score (0-1000 scale), VLM adjusts ±50 points for consistency and accuracy
+- **v0.1.3** (2026-08-25): CV-driven grading with VLM validation — CV metrics calculate base score (0-1000 scale), VLM adjusts ±50 points for consistency and accuracy
+- **v0.1.4** (2026-08-26): Enhanced detection & grading — PSA 1-10 scale refactor, camera improvements (grab/retrieve, 5fps support, 5120×2880), centering black background detection, surface smart scratch filtering (background suppression, count-based scoring), 50px margin for corner extraction
+
+---
+
+## Background Frame Considerations (2026-08-26)
+
+**Current:** Black PLA frame
+**Issues identified:**
+- Low contrast with dark cards/corners
+- Absorbs light (requires more illumination)
+- Only 13.9% background detected (should be higher)
+- Corner wear (darkening) blends with black
+
+**Recommended alternatives:**
+- **Chroma green:** Maximum contrast with all card colors, easy HSV masking, industry standard
+- **Bright blue:** Good contrast, less aggressive than green, code already supports blue detection
+- **Medium grey:** Neutral, professional appearance, balanced contrast
+
+**Tradeoff:** Black looks professional but detection reliability is lower than colored backgrounds.
 
 ---
 
